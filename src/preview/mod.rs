@@ -364,10 +364,35 @@ fn sniff_text(path: &str, size: u64) -> std::io::Result<Option<Content>> {
 }
 
 fn pdf_preview(path: &str, opts: PreviewOptions, cancelled: &dyn Fn() -> bool) -> Result<Content, String> {
-    match helper::render(helper::HelperKind::Pdf, path, opts.max_px, opts.page, HELPER_TIMEOUT, cancelled) {
-        Ok(out) => Ok(Content::Pdf { page: out.image, page_count: out.page_count, index: opts.page.min(out.page_count.saturating_sub(1)) }),
+    use helper::HelperKind;
+    // Once the default renderer has crashed and safe mode worked on this
+    // machine, go straight to safe mode for the rest of the session.
+    static USE_SAFE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let ok = |out: helper::HelperOutput| Content::Pdf {
+        index: opts.page.min(out.page_count.saturating_sub(1)),
+        page: out.image,
+        page_count: out.page_count,
+    };
+    let first = if USE_SAFE.load(Ordering::Relaxed) { HelperKind::PdfSafe } else { HelperKind::Pdf };
+    match helper::render(first, path, opts.max_px, opts.page, HELPER_TIMEOUT, cancelled) {
+        Ok(out) => Ok(ok(out)),
         Err(e) if e == "cancelled" => Err(e),
-        Err(e) => other_preview(path, cancelled, Some(format!("PDF preview unavailable: {e}"))),
+        Err(e) if first == HelperKind::Pdf && e.contains("crashed") => {
+            tracing::warn!(path, "PDF renderer crashed; retrying in safe mode: {e}");
+            match helper::render(HelperKind::PdfSafe, path, opts.max_px, opts.page, HELPER_TIMEOUT, cancelled) {
+                Ok(out) => {
+                    USE_SAFE.store(true, Ordering::Relaxed);
+                    Ok(ok(out))
+                }
+                Err(e2) if e2 == "cancelled" => Err(e2),
+                Err(e2) => other_preview(
+                    path,
+                    cancelled,
+                    Some(format!("PDF preview unavailable: {e} A retry with basic settings also failed: {e2} Use Open to view it.")),
+                ),
+            }
+        }
+        Err(e) => other_preview(path, cancelled, Some(format!("PDF preview unavailable: {e} Use Open to view it."))),
     }
 }
 

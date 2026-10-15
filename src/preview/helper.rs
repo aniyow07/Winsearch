@@ -21,6 +21,8 @@ const MAX_PIXELS: u64 = 4096 * 4096;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HelperKind {
     Pdf,
+    /// PDF with default render settings, used after a crash.
+    PdfSafe,
     Thumbnail,
 }
 
@@ -28,6 +30,7 @@ impl HelperKind {
     fn arg(self) -> &'static str {
         match self {
             HelperKind::Pdf => "pdf",
+            HelperKind::PdfSafe => "pdf-safe",
             HelperKind::Thumbnail => "thumb",
         }
     }
@@ -99,12 +102,27 @@ pub fn render(
     let out = reader.join().unwrap_or_default();
     let err = err_reader.join().unwrap_or_default();
     if !status.success() {
-        let msg = err.trim();
-        return Err(if msg.is_empty() {
-            format!("preview helper failed ({status})")
-        } else {
-            msg.to_string()
-        });
+        // Stage markers ("stage: …") tell how far a crashed helper got.
+        let last_stage = err.lines().rev().find_map(|l| l.strip_prefix("stage: ")).map(str::to_string);
+        let message = err.lines().filter(|l| !l.starts_with("stage: ")).collect::<Vec<_>>().join(" ");
+        let code = status.code().map(|c| c as u32);
+        let what = match kind {
+            HelperKind::Pdf | HelperKind::PdfSafe => "The Windows PDF renderer",
+            HelperKind::Thumbnail => "The thumbnail provider for this file type",
+        };
+        let text = match code {
+            // STATUS_STACK_BUFFER_OVERRUN / fail-fast and access violations:
+            // native code crashed inside the isolated helper.
+            Some(0xC000_0409) | Some(0xC000_0005) | Some(0xC000_00FD) => format!(
+                "{what} crashed on this file (0x{:08X}{}). WinSearch itself is unaffected.",
+                code.unwrap_or(0),
+                last_stage.map(|s| format!(", while: {s}")).unwrap_or_default()
+            ),
+            _ if !message.trim().is_empty() => message.trim().to_string(),
+            _ => format!("preview helper failed ({status})"),
+        };
+        tracing::warn!(?kind, path, ?code, stderr = %err.trim(), "preview helper failed");
+        return Err(text);
     }
     decode_output(&out)
 }
@@ -149,11 +167,19 @@ pub fn helper_main(args: &[String]) -> i32 {
         return 2;
     };
     let max_px: u32 = max.parse().unwrap_or(1024).clamp(16, 4096);
-    let result = match kind.as_str() {
-        "pdf" => render_pdf(path, max_px, args.get(3).and_then(|p| p.parse().ok()).unwrap_or(0)),
+    // Report Rust panics as an error message and exit code 1 instead of
+    // an abort, so the parent can tell them apart from native crashes.
+    std::panic::set_hook(Box::new(|info| {
+        let _ = writeln!(std::io::stderr(), "preview helper internal error: {info}");
+    }));
+    let page = args.get(3).and_then(|p| p.parse().ok()).unwrap_or(0);
+    let result = std::panic::catch_unwind(|| match kind.as_str() {
+        "pdf" => render_pdf(path, max_px, page, false),
+        "pdf-safe" => render_pdf(path, max_px, page, true),
         "thumb" => render_thumbnail(path, max_px),
         _ => Err("unknown preview kind".to_string()),
-    };
+    })
+    .unwrap_or_else(|_| Err("preview helper internal error".to_string()));
     match result {
         Ok(out) => {
             let mut buf = Vec::with_capacity(16 + out.image.rgba.len());
@@ -176,7 +202,7 @@ pub fn helper_main(args: &[String]) -> i32 {
 }
 
 /// Renders page 1 with the built-in Windows.Data.Pdf engine (Windows 10+).
-fn render_pdf(path: &str, max_px: u32, page_index: u32) -> Result<HelperOutput, String> {
+fn render_pdf(path: &str, max_px: u32, page_index: u32, safe: bool) -> Result<HelperOutput, String> {
     use windows::Data::Pdf::{PdfDocument, PdfPageRenderOptions};
     use windows::Storage::StorageFile;
     use windows::Storage::Streams::{DataReader, InMemoryRandomAccessStream};
@@ -189,9 +215,11 @@ fn render_pdf(path: &str, max_px: u32, page_index: u32) -> Result<HelperOutput, 
     }
     // WinRT storage APIs only accept absolute paths.
     let abs = std::path::absolute(path).map_err(|x| format!("bad path: {x}"))?;
+    stage("opening the file");
     let file = StorageFile::GetFileFromPathAsync(&HSTRING::from(abs.as_os_str()))
         .and_then(|op| op.join())
         .map_err(|x| e("cannot open file", x))?;
+    stage("loading the PDF");
     let doc = PdfDocument::LoadFromFileAsync(&file)
         .and_then(|op| op.join())
         .map_err(|x| e("cannot read PDF (damaged or password-protected?)", x))?;
@@ -200,24 +228,37 @@ fn render_pdf(path: &str, max_px: u32, page_index: u32) -> Result<HelperOutput, 
         return Err("PDF has no pages".into());
     }
     let index = page_index.min(pages - 1);
+    stage("reading the page");
     let page = doc.GetPage(index).map_err(|x| e("PDF page", x))?;
     let size = page.Size().map_err(|x| e("PDF page size", x))?;
     let (pw, ph) = (size.Width.max(1.0), size.Height.max(1.0));
     let scale = (max_px as f32 / pw).min(max_px as f32 / ph);
     let (w, h) = (((pw * scale) as u32).max(1), ((ph * scale) as u32).max(1));
-    let opts = PdfPageRenderOptions::new().map_err(|x| e("render options", x))?;
-    opts.SetDestinationWidth(w).map_err(|x| e("render options", x))?;
-    opts.SetDestinationHeight(h).map_err(|x| e("render options", x))?;
     let stream = InMemoryRandomAccessStream::new().map_err(|x| e("stream", x))?;
-    page.RenderWithOptionsToStreamAsync(&stream, &opts)
-        .and_then(|op| op.join())
-        .map_err(|x| e("cannot render PDF page", x))?;
+    if safe {
+        // Fallback after a crash: default render settings (page size at
+        // 96 DPI, default encoder), resized below.
+        stage("rendering the page (safe mode)");
+        page.RenderToStreamAsync(&stream)
+            .and_then(|op| op.join())
+            .map_err(|x| e("cannot render PDF page", x))?;
+    } else {
+        let opts = PdfPageRenderOptions::new().map_err(|x| e("render options", x))?;
+        opts.SetDestinationWidth(w).map_err(|x| e("render options", x))?;
+        opts.SetDestinationHeight(h).map_err(|x| e("render options", x))?;
+        stage("rendering the page");
+        page.RenderWithOptionsToStreamAsync(&stream, &opts)
+            .and_then(|op| op.join())
+            .map_err(|x| e("cannot render PDF page", x))?;
+    }
     let len = stream.Size().map_err(|x| e("stream", x))? as u32;
     let input = stream.GetInputStreamAt(0).map_err(|x| e("stream", x))?;
+    stage("reading the rendered page");
     let reader = DataReader::CreateDataReader(&input).map_err(|x| e("stream", x))?;
     reader.LoadAsync(len).and_then(|op| op.join()).map_err(|x| e("stream", x))?;
     let mut png = vec![0u8; len as usize];
     reader.ReadBytes(&mut png).map_err(|x| e("stream", x))?;
+    stage("decoding the rendered page");
     let mut img = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
         .map_err(|x| format!("rendered page could not be decoded: {x}"))?;
     // The destination size is interpreted in DIPs, so on scaled displays
@@ -246,9 +287,11 @@ fn render_thumbnail(path: &str, max_px: u32) -> Result<HelperOutput, String> {
 
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        stage("opening the item in the Shell");
         let factory: IShellItemImageFactory = SHCreateItemFromParsingName(&HSTRING::from(path), None)
             .map_err(|e| format!("shell cannot open item: {}", e.message()))?;
         let size = SIZE { cx: max_px as i32, cy: max_px as i32 };
+        stage("asking the Shell for a thumbnail");
         let hbmp = factory
             .GetImage(size, SIIGBF_RESIZETOFIT)
             .map_err(|e| format!("no thumbnail available: {}", e.message()))?;
@@ -312,4 +355,12 @@ mod tests {
         ok.push(0); // wrong length
         assert!(decode_output(&ok).is_err());
     }
+}
+
+/// Progress marker on stderr; the parent quotes the last one if the
+/// helper crashes, so a crash report says which step failed.
+fn stage(s: &str) {
+    let mut e = std::io::stderr().lock();
+    let _ = writeln!(e, "stage: {s}");
+    let _ = e.flush();
 }
