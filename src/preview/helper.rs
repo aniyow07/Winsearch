@@ -15,6 +15,8 @@ use super::ImageData;
 
 pub const HELPER_FLAG: &str = "--render-preview";
 const MAGIC: &[u8; 4] = b"WSPV";
+/// Largest PDF read into memory by the safe-mode renderer.
+const MAX_PDF_BYTES: u64 = 256 * 1024 * 1024;
 /// Hard ceiling on pixels the parent accepts from the helper.
 const MAX_PIXELS: u64 = 4096 * 4096;
 
@@ -205,7 +207,7 @@ pub fn helper_main(args: &[String]) -> i32 {
 fn render_pdf(path: &str, max_px: u32, page_index: u32, safe: bool) -> Result<HelperOutput, String> {
     use windows::Data::Pdf::{PdfDocument, PdfPageRenderOptions};
     use windows::Storage::StorageFile;
-    use windows::Storage::Streams::{DataReader, InMemoryRandomAccessStream};
+    use windows::Storage::Streams::{DataReader, DataWriter, InMemoryRandomAccessStream};
     use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
     use windows::core::HSTRING;
 
@@ -213,16 +215,44 @@ fn render_pdf(path: &str, max_px: u32, page_index: u32, safe: bool) -> Result<He
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
-    // WinRT storage APIs only accept absolute paths.
-    let abs = std::path::absolute(path).map_err(|x| format!("bad path: {x}"))?;
-    stage("opening the file");
-    let file = StorageFile::GetFileFromPathAsync(&HSTRING::from(abs.as_os_str()))
-        .and_then(|op| op.join())
-        .map_err(|x| e("cannot open file", x))?;
-    stage("loading the PDF");
-    let doc = PdfDocument::LoadFromFileAsync(&file)
-        .and_then(|op| op.join())
-        .map_err(|x| e("cannot read PDF (damaged or password-protected?)", x))?;
+    let doc = if safe {
+        // Safe mode: read the bytes ourselves and hand the engine a memory
+        // stream. This skips StorageFile, which goes through the Shell and
+        // can load third-party PDF handlers (e.g. office suites) that crash.
+        stage("reading the file");
+        let bytes = std::fs::metadata(path)
+            .map_err(|x| format!("cannot open file: {x}"))
+            .and_then(|m| {
+                if m.len() > MAX_PDF_BYTES {
+                    Err(format!("PDF is too large to preview ({} MB)", m.len() / 1_048_576))
+                } else {
+                    std::fs::read(path).map_err(|x| format!("cannot open file: {x}"))
+                }
+            })?;
+        let mem = InMemoryRandomAccessStream::new().map_err(|x| e("stream", x))?;
+        let out = mem.GetOutputStreamAt(0).map_err(|x| e("stream", x))?;
+        let writer = DataWriter::CreateDataWriter(&out).map_err(|x| e("stream", x))?;
+        writer.WriteBytes(&bytes).map_err(|x| e("stream", x))?;
+        writer.StoreAsync().and_then(|op| op.join()).map_err(|x| e("stream", x))?;
+        writer.FlushAsync().and_then(|op| op.join()).map_err(|x| e("stream", x))?;
+        let _ = writer.DetachStream();
+        mem.Seek(0).map_err(|x| e("stream", x))?;
+        stage("loading the PDF (safe mode)");
+        PdfDocument::LoadFromStreamAsync(&mem)
+            .and_then(|op| op.join())
+            .map_err(|x| e("cannot read PDF (damaged or password-protected?)", x))?
+    } else {
+        // WinRT storage APIs only accept absolute paths.
+        let abs = std::path::absolute(path).map_err(|x| format!("bad path: {x}"))?;
+        stage("opening the file");
+        let file = StorageFile::GetFileFromPathAsync(&HSTRING::from(abs.as_os_str()))
+            .and_then(|op| op.join())
+            .map_err(|x| e("cannot open file", x))?;
+        stage("loading the PDF");
+        PdfDocument::LoadFromFileAsync(&file)
+            .and_then(|op| op.join())
+            .map_err(|x| e("cannot read PDF (damaged or password-protected?)", x))?
+    };
     let pages = doc.PageCount().map_err(|x| e("PDF", x))?;
     if pages == 0 {
         return Err("PDF has no pages".into());
