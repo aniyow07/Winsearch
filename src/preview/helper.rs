@@ -187,7 +187,9 @@ fn render_pdf(path: &str, max_px: u32, page_index: u32) -> Result<HelperOutput, 
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
-    let file = StorageFile::GetFileFromPathAsync(&HSTRING::from(path))
+    // WinRT storage APIs only accept absolute paths.
+    let abs = std::path::absolute(path).map_err(|x| format!("bad path: {x}"))?;
+    let file = StorageFile::GetFileFromPathAsync(&HSTRING::from(abs.as_os_str()))
         .and_then(|op| op.join())
         .map_err(|x| e("cannot open file", x))?;
     let doc = PdfDocument::LoadFromFileAsync(&file)

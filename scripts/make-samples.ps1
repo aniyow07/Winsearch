@@ -103,6 +103,22 @@ $g.Dispose()
 $bmp.Save((Join-Path $Out "sample-large-image.png"), [System.Drawing.Imaging.ImageFormat]::Png)
 $bmp.Dispose()
 
+# --- Photo-sized JPEG (4000 x 3000, used for preview timing) ---------------
+$bmp = New-Object System.Drawing.Bitmap 4000, 3000
+$g = [System.Drawing.Graphics]::FromImage($bmp)
+$rnd = New-Object System.Random 7
+for ($i = 0; $i -lt 400; $i++) {
+    $c = [System.Drawing.Color]::FromArgb($rnd.Next(256), $rnd.Next(256), $rnd.Next(256))
+    $b = New-Object System.Drawing.SolidBrush $c
+    $g.FillEllipse($b, $rnd.Next(4000), $rnd.Next(3000), $rnd.Next(50, 600), $rnd.Next(50, 600))
+}
+$g.Dispose()
+$jpeg = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object MimeType -eq "image/jpeg"
+$ep = New-Object System.Drawing.Imaging.EncoderParameters 1
+$ep.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, [long]90)
+$bmp.Save((Join-Path $Out "sample-photo-12mp.jpg"), $jpeg, $ep)
+$bmp.Dispose()
+
 # --- Text --------------------------------------------------------------------
 Set-Content -Encoding UTF8 (Join-Path $Out "sample-notes.md") "# Sample notes`n`nText and source files preview with line wrapping.`nCtrl+mouse wheel changes the text size.`n"
 Get-ChildItem $Out | Select-Object Name, Length

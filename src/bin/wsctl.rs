@@ -61,6 +61,34 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        "preview" => {
+            // Preview generation latency per file (cold first, then warm).
+            for p in &rest {
+                let mut times = Vec::new();
+                let mut label = String::new();
+                for _ in 0..3 {
+                    let t = Instant::now();
+                    let pv = winsearch::preview::generate(
+                        0,
+                        p,
+                        std::path::Path::new(p).is_dir(),
+                        Default::default(),
+                        &|| false,
+                    );
+                    times.push(t.elapsed().as_secs_f64() * 1000.0);
+                    label = match &pv.content {
+                        Ok(c) => format!("{} ok ({})", pv.kind_label, content_kind(c)),
+                        Err(e) => format!("{} error: {e}", pv.kind_label),
+                    };
+                }
+                println!(
+                    "{:>8.1} ms first, {:>7.1} ms repeat  {label}  {p}",
+                    times[0],
+                    times[1].min(times[2])
+                );
+            }
+            Ok(())
+        }
         "exec" => {
             let conn = rusqlite::Connection::open(&db_path)?;
             let t = Instant::now();
@@ -260,4 +288,19 @@ fn bench(db_path: &PathBuf) -> Result<()> {
     }
     println!("{:<30} {}", "engine ranked top-500", cells.join(" | "));
     Ok(())
+}
+
+fn content_kind(c: &winsearch::preview::Content) -> String {
+    use winsearch::preview::Content;
+    match c {
+        Content::Image { image, original, .. } => {
+            format!("image {}x{} from {}x{}", image.width, image.height, original.0, original.1)
+        }
+        Content::Pdf { page, page_count, .. } => format!("pdf page {}x{}, {page_count} pages", page.width, page.height),
+        Content::Text { text, truncated, .. } => format!("text {} bytes{}", text.len(), if *truncated { ", truncated" } else { "" }),
+        Content::Document { blocks, .. } => format!("docx {} blocks", blocks.len()),
+        Content::Sheets { sheets } => format!("xlsx {} sheets", sheets.len()),
+        Content::Folder { total, .. } => format!("folder {total} items"),
+        Content::Info { icon, note } => format!("info{}{}", if icon.is_some() { " +shell icon" } else { "" }, note.as_ref().map(|n| format!(" ({n})")).unwrap_or_default()),
+    }
 }
