@@ -1,0 +1,72 @@
+[package]
+name = "winsearch"
+version = "0.1.0"
+edition = "2024"
+description = "Fast local filename search with file previews for Windows"
+license = "MIT"
+publish = false
+
+[lib]
+name = "winsearch"
+path = "src/lib.rs"
+
+[[bin]]
+name = "winsearch"
+path = "src/main.rs"
+
+[[bin]]
+name = "wsctl"
+path = "src/bin/wsctl.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+crossbeam-channel = "0.5.17"
+eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "glow", "accesskit"] }
+egui = "0.35.0"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp", "ico", "tiff"] }
+memchr = "2.8.3"
+parking_lot = "0.12.5"
+quick-xml = "0.42.0"
+rfd = "0.17.2"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+windows = { version = "0.62.2", features = [
+    "Data_Pdf",
+    "Foundation",
+    "Storage",
+    "Storage_Streams",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+    "Win32_System_WinRT",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }
+zip = { version = "9.0.3", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+strip = "symbols"
+
+# Keep image decoding and SQLite fast in debug test runs too.
+[profile.dev.package."*"]
+opt-level = 2
