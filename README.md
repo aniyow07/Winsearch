@@ -1,4 +1,4 @@
-﻿# WinSearch
+# WinSearch
 
 A fast, local filename search for Windows 10 and 11 with a built-in preview
 pane. It keeps its own index of file and folder names in SQLite, so
@@ -157,7 +157,11 @@ reads directory listings and, for the selected file, its contents.
   styling or formulas; Excel shows stored values, so dates appear as serial
   numbers). Legacy .doc/.xls files fall back to the Windows thumbnail.
 * PDF previews take ~0.3 s because each render starts an isolated helper
-  process; password-protected PDFs are not previewed.
+  process; password-protected PDFs are not previewed. On some machines with
+  third-party PDF software installed (seen with WPS Office), Windows' PDF
+  engine crashed while shutting down after rendering; since 0.1.1 the helper
+  delivers the page first and exits without that cleanup, and a crashed render
+  is retried once from an in-memory copy of the file.
 * File names that are not valid UTF-16 (unpaired surrogates) are stored in
   a lossy form.
 * Network drives are scanned like local ones; change notifications on them
