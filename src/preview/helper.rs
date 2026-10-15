@@ -103,6 +103,14 @@ pub fn render(
     };
     let out = reader.join().unwrap_or_default();
     let err = err_reader.join().unwrap_or_default();
+    // A complete, well-formed image counts even if the helper crashed while
+    // shutting down afterwards.
+    if !status.success()
+        && let Ok(output) = decode_output(&out)
+    {
+        tracing::warn!(?kind, path, code = ?status.code(), "preview helper crashed after delivering the image");
+        return Ok(output);
+    }
     if !status.success() {
         // Stage markers ("stage: …") tell how far a crashed helper got.
         let last_stage = err.lines().rev().find_map(|l| l.strip_prefix("stage: ")).map(str::to_string);
@@ -190,9 +198,17 @@ pub fn helper_main(args: &[String]) -> i32 {
             buf.extend_from_slice(&out.image.height.to_le_bytes());
             buf.extend_from_slice(&out.page_count.to_le_bytes());
             buf.extend_from_slice(&out.image.rgba);
+            stage("sending the image");
             let mut so = std::io::stdout().lock();
             if so.write_all(&buf).and_then(|_| so.flush()).is_err() {
                 return 3;
+            }
+            drop(so);
+            // The image is delivered; end the process without running DLL
+            // shutdown code from components we do not control.
+            unsafe {
+                use windows::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+                let _ = TerminateProcess(GetCurrentProcess(), 0);
             }
             0
         }
@@ -288,15 +304,21 @@ fn render_pdf(path: &str, max_px: u32, page_index: u32, safe: bool) -> Result<He
     reader.LoadAsync(len).and_then(|op| op.join()).map_err(|x| e("stream", x))?;
     let mut png = vec![0u8; len as usize];
     reader.ReadBytes(&mut png).map_err(|x| e("stream", x))?;
-    stage("decoding the rendered page");
+    stage(&format!("decoding the rendered page ({} KB PNG)", png.len() / 1024));
     let mut img = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
         .map_err(|x| format!("rendered page could not be decoded: {x}"))?;
+    stage(&format!("scaling the rendered page ({}x{})", img.width(), img.height()));
     // The destination size is interpreted in DIPs, so on scaled displays
     // the page comes back larger than asked for; bring it back in bounds.
     if img.width() > max_px || img.height() > max_px {
         img = img.resize(max_px, max_px, image::imageops::FilterType::Triangle);
     }
     let img = img.to_rgba8();
+    stage("releasing the PDF engine");
+    // Releasing the PDF objects has crashed inside Windows on some systems
+    // (third-party components hooked into it). The process exits right
+    // after sending the image, so leak them instead of releasing them.
+    std::mem::forget((doc, page, stream, input, reader));
     Ok(HelperOutput {
         image: ImageData { width: img.width(), height: img.height(), rgba: img.into_raw() },
         page_count: pages,
