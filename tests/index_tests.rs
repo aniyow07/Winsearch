@@ -183,6 +183,31 @@ fn incremental_file_rename_and_delete() {
 }
 
 #[test]
+fn in_app_rename_updates_the_index() {
+    let mut f = fixture();
+    let from = format!("{}\\docs\\readme.md", f.root);
+    let to = winsearch::fileops::rename(&from, "notes.md").unwrap();
+    apply(&mut f, vec![Change::Rename { from, to: to.clone() }]);
+    assert!(search(&f, "readme").is_empty());
+    assert_eq!(search(&f, "notes"), vec![to]);
+}
+
+#[test]
+fn case_only_directory_rename_keeps_descendants() {
+    let mut f = fixture();
+    let from = format!("{}\\src", f.root);
+    let to = winsearch::fileops::rename(&from, "SRC").unwrap();
+    assert_eq!(to, format!("{}\\SRC", f.root));
+    apply(&mut f, vec![Change::Rename { from, to: to.clone() }]);
+    let rec = f.db.get(&to).unwrap().unwrap();
+    assert_eq!(rec.name, "SRC");
+    let hits = search(&f, "main.rs");
+    assert_eq!(hits.len(), 2, "{hits:?}");
+    assert!(hits.iter().all(|p| p.starts_with(&to)), "{hits:?}");
+    assert_eq!(f.db.children(&to).unwrap().len(), 2, "main.rs and lib");
+}
+
+#[test]
 fn incremental_directory_rename_moves_descendants() {
     let mut f = fixture();
     let from = format!("{}\\src", f.root);

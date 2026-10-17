@@ -30,6 +30,9 @@ pub struct AppConfig {
     pub clutter_folders: Vec<String>,
     /// Folders recently picked as search scope (most recent first).
     pub recent_scopes: Vec<String>,
+    /// Widths of the result columns (Name, Folder, Size, Modified) in
+    /// points, once the user has dragged a divider (None = automatic).
+    pub column_widths: Option<[f32; 4]>,
 }
 
 pub fn default_clutter_folders() -> Vec<String> {
@@ -67,6 +70,7 @@ impl Default for AppConfig {
             hide_clutter: true,
             clutter_folders: default_clutter_folders(),
             recent_scopes: Vec::new(),
+            column_widths: None,
         }
     }
 }
@@ -126,6 +130,10 @@ impl AppConfig {
         }
         self.result_limit = self.result_limit.clamp(100, 100_000);
         self.scan_threads = self.scan_threads.clamp(1, 32);
+        self.column_widths = self
+            .column_widths
+            .filter(|w| w.iter().all(|v| v.is_finite()))
+            .map(|w| w.map(|v| v.clamp(40.0, 4000.0)));
     }
 }
 

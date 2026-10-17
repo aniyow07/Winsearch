@@ -131,24 +131,15 @@ fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-/// A small magnifier icon for the window, drawn at startup.
+/// The window icon (the same art as the .ico embedded in the executable).
 pub fn window_icon() -> egui::IconData {
-    let n = 64usize;
-    let mut rgba = vec![0u8; n * n * 4];
-    let (cx, cy, r) = (26.0f32, 26.0f32, 16.0f32);
-    for y in 0..n {
-        for x in 0..n {
-            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
-            let d = ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt();
-            let ring = (d - r).abs() < 4.5;
-            let t = ((fx - cx) + (fy - cy)) / 2.0;
-            let off = ((fx - cx) - (fy - cy)).abs() / std::f32::consts::SQRT_2;
-            let handle = t > r * 0.75 && t < r * 1.9 && off < 4.5;
-            if ring || handle {
-                let i = (y * n + x) * 4;
-                rgba[i..i + 4].copy_from_slice(&[ACCENT.r(), ACCENT.g(), ACCENT.b(), 255]);
-            }
+    const PNG: &[u8] = include_bytes!("../../assets/icon.png");
+    let n = 128;
+    match image::load_from_memory_with_format(PNG, image::ImageFormat::Png) {
+        Ok(img) => {
+            let img = img.resize_exact(n, n, image::imageops::FilterType::Triangle).to_rgba8();
+            egui::IconData { rgba: img.into_raw(), width: n, height: n }
         }
+        Err(_) => egui::IconData::default(),
     }
-    egui::IconData { rgba, width: n as u32, height: n as u32 }
 }

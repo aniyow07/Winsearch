@@ -144,8 +144,20 @@ impl IndexerHandle {
         let thread = std::thread::Builder::new()
             .name("indexer".into())
             .spawn(move || {
-                let mut ix = Indexer::new(db_path, cfg, st, tx2, rx);
-                ix.run();
+                let st2 = st.clone();
+                let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    let mut ix = Indexer::new(db_path, cfg, st, tx2, rx);
+                    ix.run();
+                }));
+                if run.is_err() {
+                    // The panic itself is in the log (see main.rs). Searching
+                    // keeps working on the existing index.
+                    st2.update(|s| {
+                        s.phase = Phase::Failed(
+                            "Index updates stopped after an internal error. Restart WinSearch; details are in the log.".into(),
+                        )
+                    });
+                }
             })
             .expect("spawn indexer thread");
         IndexerHandle { tx, status, thread: Some(thread) }
@@ -159,6 +171,13 @@ impl IndexerHandle {
 
     pub fn cancel_scan(&self) {
         self.status.cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// Tells the indexer about a rename the app itself just made, so the
+    /// index is updated right away instead of waiting for the change source.
+    pub fn notify_renamed(&self, from: String, to: String) {
+        let root = to.clone();
+        self.send(Command::Watch { root, event: WatchEvent::Changes(vec![Change::Rename { from, to }]) });
     }
 }
 

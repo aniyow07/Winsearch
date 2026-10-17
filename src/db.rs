@@ -512,8 +512,11 @@ impl Db {
     pub fn rename_tree(&self, from: &str, to: &str, root_id: i64) -> Result<u64> {
         let from = from.trim_end_matches('\\');
         let to = to.trim_end_matches('\\');
-        // Anything previously indexed at the destination is stale now.
-        self.remove_tree(to)?;
+        // Anything previously indexed at the destination is stale now. Paths
+        // compare without case, so a case-only rename must keep the source.
+        if !from.eq_ignore_ascii_case(to) {
+            self.remove_tree(to)?;
+        }
         // Keep the directory's row id: its children reference it.
         let new_name = util::split_path(to).map(|(_, n)| n).unwrap_or(to);
         self.conn.execute(

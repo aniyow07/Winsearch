@@ -49,11 +49,11 @@ impl SearchWorker {
                             }
                         }
                     }
-                    let result = engine
-                        .as_ref()
-                        .unwrap()
-                        .search(&req.query, req.limit)
-                        .map_err(|e| format!("Search failed: {e:#}"));
+                    let Some(eng) = engine.as_ref() else { continue };
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        eng.search(&req.query, req.limit).map_err(|e| format!("Search failed: {e:#}"))
+                    }))
+                    .unwrap_or_else(|_| Err("Search failed after an internal error (details are in the log).".into()));
                     if result.is_err() {
                         // Reopen next time (database may have been rebuilt).
                         engine = None;

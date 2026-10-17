@@ -1,6 +1,7 @@
 // No console window for the release GUI build.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod crash;
 mod ui;
 
 use winsearch::config::{self, AppConfig};
@@ -8,15 +9,17 @@ use winsearch::preview::helper;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    // Preview helper mode: render one PDF page / thumbnail and exit.
+    // Preview helper mode. To keep crashes in Windows' PDF engine and in
+    // third-party thumbnail providers away from the search window, WinSearch
+    // starts a second, windowless copy of itself with this flag for each PDF
+    // page or thumbnail. That copy renders one image, writes it to its
+    // standard output for the parent and exits; it never does anything else.
     if args.get(1).map(String::as_str) == Some(helper::HELPER_FLAG) {
         std::process::exit(helper::helper_main(&args[2..]));
     }
 
     let _log_guard = init_logging();
-    std::panic::set_hook(Box::new(|info| {
-        tracing::error!("panic: {info}");
-    }));
+    crash::install();
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "WinSearch starting");
 
     let start = ui::StartOptions::from_args(&args);
@@ -66,7 +69,7 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     Some(guard)
 }
 
-fn show_fatal(msg: &str) {
+pub(crate) fn show_fatal(msg: &str) {
     use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
     use windows::core::HSTRING;
     unsafe {

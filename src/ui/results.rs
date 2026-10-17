@@ -10,6 +10,8 @@ use super::{WinSearchApp, icons, theme};
 
 pub const ROW_H: f32 = 30.0;
 const PAD_X: f32 = 14.0;
+/// Narrowest each column (Name, Folder, Size, Modified) can be dragged.
+const MIN_W: [f32; 4] = [120.0, 100.0, 60.0, 90.0];
 
 struct Columns {
     name: f32,
@@ -18,11 +20,51 @@ struct Columns {
     modified: f32,
 }
 
-fn columns(width: f32) -> Columns {
-    let size = 86.0;
-    let modified = 142.0;
-    let rest = (width - size - modified - PAD_X * 2.0).max(240.0);
-    Columns { name: rest * 0.40, path: rest * 0.60, size, modified }
+impl Columns {
+    fn widths(&self) -> [f32; 4] {
+        [self.name, self.path, self.size, self.modified]
+    }
+}
+
+/// Column widths for a table `width` points wide. Without saved widths the
+/// columns fill the table (Name 40 % and Folder 60 % of what Size and
+/// Modified leave). Saved widths (set by dragging the header dividers) are
+/// used as they are, except that a narrower window takes space from Folder
+/// first, then Name, Modified and Size, down to their minimums.
+fn columns(width: f32, saved: Option<[f32; 4]>) -> Columns {
+    let avail = width - PAD_X * 2.0;
+    let w = match saved {
+        None => {
+            let (size, modified) = (86.0, 142.0);
+            let rest = (avail - size - modified).max(240.0);
+            [rest * 0.40, rest * 0.60, size, modified]
+        }
+        Some(mut w) => {
+            for (v, min) in w.iter_mut().zip(MIN_W) {
+                *v = v.max(min);
+            }
+            fit(&mut w, avail, None);
+            w
+        }
+    };
+    Columns { name: w[0], path: w[1], size: w[2], modified: w[3] }
+}
+
+/// Shrinks columns other than `keep` until the total fits in `avail`:
+/// Folder first, then Name, Modified and Size, never below their minimums.
+fn fit(w: &mut [f32; 4], avail: f32, keep: Option<usize>) {
+    let mut over = w.iter().sum::<f32>() - avail;
+    for i in [1, 0, 3, 2] {
+        if over <= 0.0 {
+            break;
+        }
+        if Some(i) == keep {
+            continue;
+        }
+        let take = (w[i] - MIN_W[i]).min(over).max(0.0);
+        w[i] -= take;
+        over -= take;
+    }
 }
 
 pub fn show(app: &mut WinSearchApp, ui: &mut Ui) {
@@ -36,7 +78,7 @@ pub fn show(app: &mut WinSearchApp, ui: &mut Ui) {
         return;
     }
 
-    let cols = columns(ui.available_width());
+    let cols = columns(ui.available_width(), app.cfg.column_widths);
     header(app, ui, &cols);
 
     if app.results.is_empty() {
@@ -77,10 +119,11 @@ pub fn show(app: &mut WinSearchApp, ui: &mut Ui) {
     let mut clicked: Option<usize> = None;
     let mut double: Option<usize> = None;
     let mut menu_action: Option<(usize, MenuAction)> = None;
+    let mut rename_lost_focus = false;
     let terms = app.highlight_terms.clone();
     scroll.show_rows(ui, ROW_H, n, |ui, range| {
         for i in range {
-            let hit = &app.results[i];
+            let hit = app.results[i].clone();
             let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
             let selected = app.selected == Some(i);
             let painter = ui.painter_at(rect);
@@ -104,8 +147,13 @@ pub fn show(app: &mut WinSearchApp, ui: &mut Ui) {
             icons::file_icon(&painter, Rect::from_center_size(egui::pos2(x + 8.0, y), vec2(16.0, 16.0)), cat);
             let name_font = FontId::proportional(14.0);
             let name_color = if selected { Color32::WHITE } else { theme::TEXT };
-            let job = highlighted(&hit.name, &terms, name_font, name_color, cols.name - 34.0);
-            paint_job(ui, &painter, x + 26.0, y, job);
+            if let Some(r) = app.rename.as_mut().filter(|r| r.path == hit.path) {
+                let edit = Rect::from_min_max(egui::pos2(x + 20.0, rect.min.y + 3.0), egui::pos2(x + cols.name - 6.0, rect.max.y - 3.0));
+                rename_lost_focus |= rename_editor(ui, r, edit);
+            } else {
+                let job = highlighted(&hit.name, &terms, name_font, name_color, cols.name - 34.0);
+                paint_job(ui, &painter, x + 26.0, y, job);
+            }
             x += cols.name;
 
             let dim = if selected { theme::TEXT } else { theme::TEXT_DIM };
@@ -119,7 +167,8 @@ pub fn show(app: &mut WinSearchApp, ui: &mut Ui) {
                 painter.text(egui::pos2(x + cols.size - 14.0, y), Align2::RIGHT_CENTER, util::format_size(hit.size), meta_font.clone(), dim);
             }
             x += cols.size;
-            painter.text(egui::pos2(x, y), Align2::LEFT_CENTER, util::format_time(hit.modified), meta_font, dim);
+            let job = plain(&util::format_time(hit.modified), meta_font, dim, cols.modified - 8.0);
+            paint_job(ui, &painter, x, y, job);
 
             if resp.clicked() {
                 clicked = Some(i);
@@ -134,6 +183,7 @@ pub fn show(app: &mut WinSearchApp, ui: &mut Ui) {
                     ("Show in folder", "Ctrl+Enter", MenuAction::Reveal),
                     ("Copy path", "Ctrl+C", MenuAction::CopyPath),
                     ("Copy name", "", MenuAction::CopyName),
+                    ("Rename", "F2", MenuAction::Rename),
                     ("Search in this folder", "", MenuAction::ScopeHere),
                     ("Hide this folder from results", "", MenuAction::HideFolder),
                 ] {
@@ -145,6 +195,9 @@ pub fn show(app: &mut WinSearchApp, ui: &mut Ui) {
             });
         }
     });
+    if rename_lost_focus {
+        app.cancel_rename();
+    }
     if let Some(i) = clicked {
         app.set_selection(Some(i));
         app.focus_search = true;
@@ -170,6 +223,7 @@ pub fn show(app: &mut WinSearchApp, ui: &mut Ui) {
                     app.set_scope(Some(h.parent.clone()));
                 }
             }
+            MenuAction::Rename => app.start_rename(),
             MenuAction::CopyName => {
                 if let Some(h) = app.selected_hit() {
                     ctx.copy_text(h.name.clone());
@@ -185,8 +239,66 @@ enum MenuAction {
     Reveal,
     CopyPath,
     CopyName,
+    Rename,
     HideFolder,
     ScopeHere,
+}
+
+/// Draws the inline name editor over the Name cell. Returns true when the
+/// editor lost focus (the user clicked elsewhere), which cancels the rename.
+fn rename_editor(ui: &mut Ui, r: &mut super::RenameState, rect: Rect) -> bool {
+    use egui::text::CCursor;
+    use egui::text_selection::CCursorRange;
+    let id = egui::Id::new("rename-editor");
+    if !r.started {
+        // Select the name without its extension, as Explorer does.
+        let mut state = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
+        state.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(0), CCursor::new(r.stem_chars()))));
+        state.store(ui.ctx(), id);
+    }
+    let before = r.text.clone();
+    let resp = ui.put(
+        rect,
+        egui::TextEdit::singleline(&mut r.text)
+            .id(id)
+            .font(FontId::proportional(14.0))
+            .margin(egui::Margin::symmetric(6, 2))
+            .background_color(theme::SURFACE)
+            .desired_width(rect.width()),
+    );
+    ui.painter().rect_stroke(rect, 4.0, Stroke::new(1.0, theme::ACCENT), egui::StrokeKind::Outside);
+    let mut lost = false;
+    if !r.started {
+        resp.request_focus();
+        r.started = true;
+    } else if resp.lost_focus() {
+        lost = true;
+    }
+    if r.text != before {
+        r.error = None;
+    }
+    let message = r.error.clone();
+    let hint = message.is_none();
+    let (text, color) = match message {
+        Some(m) => (m, if r.warning { theme::WARN } else { theme::ERR }),
+        None => ("Enter to rename · Esc to cancel".to_string(), theme::TEXT_DIM),
+    };
+    egui::Area::new(egui::Id::new("rename-message"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(rect.left_bottom() + vec2(0.0, 4.0))
+        .interactable(false)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::new()
+                .fill(theme::SURFACE_HI)
+                .stroke(Stroke::new(1.0, if hint { theme::BORDER } else { color }))
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.set_max_width(rect.width().max(340.0));
+                    ui.add(egui::Label::new(RichText::new(text).size(12.5).color(color)).wrap());
+                });
+        });
+    lost
 }
 
 /// Shortens a folder path in the middle so the drive and the last, most
@@ -296,10 +408,11 @@ fn header(app: &mut WinSearchApp, ui: &mut Ui, cols: &Columns) {
         let arrow = if active { if app.descending { "  ↓" } else { "  ↑" } } else { "" };
         let text = format!("{label}{arrow}");
         let font = FontId::new(12.5, theme::strong_family());
+        let clip = ui.painter().with_clip_rect(r.shrink2(vec2(2.0, 0.0)));
         if right {
-            ui.painter().text(egui::pos2(x + w - 14.0, rect.center().y), Align2::RIGHT_CENTER, text, font, color);
+            clip.text(egui::pos2(x + w - 14.0, rect.center().y), Align2::RIGHT_CENTER, text, font, color);
         } else {
-            ui.painter().text(egui::pos2(x, rect.center().y), Align2::LEFT_CENTER, text, font, color);
+            clip.text(egui::pos2(x, rect.center().y), Align2::LEFT_CENTER, text, font, color);
         }
         if idx > 0 {
             ui.painter().vline(x - 8.0, rect.y_range().shrink(8.0), Stroke::new(1.0, theme::BORDER));
@@ -310,6 +423,7 @@ fn header(app: &mut WinSearchApp, ui: &mut Ui, cols: &Columns) {
         resp.on_hover_text("Click to sort. Click again to reverse, a third time to return to best match.");
         x += w;
     }
+    resize_handles(app, ui, rect, cols);
     if app.sort != SortKey::Relevance {
         let r = Rect::from_min_size(egui::pos2(rect.max.x - 120.0, rect.min.y), vec2(110.0, rect.height()));
         let resp = ui.interact(r, ui.id().with("hdr-best"), Sense::click());
@@ -320,6 +434,49 @@ fn header(app: &mut WinSearchApp, ui: &mut Ui, cols: &Columns) {
             app.descending = false;
             app.submit_search(true);
         }
+    }
+}
+
+/// Header dividers: dragging the one at the right edge of a column resizes
+/// that column, taking or giving space to the others when the table is full
+/// (all widths are then saved). Double-clicking any divider returns to the
+/// automatic layout.
+fn resize_handles(app: &mut WinSearchApp, ui: &mut Ui, header: Rect, cols: &Columns) {
+    let widths = cols.widths();
+    let avail = header.width() - PAD_X * 2.0;
+    let mut edge = header.min.x + PAD_X;
+    for k in 0..widths.len() {
+        edge += widths[k];
+        let line_x = edge - 8.0;
+        let hit = Rect::from_center_size(egui::pos2(line_x, header.center().y), vec2(9.0, header.height()));
+        let resp = ui.interact(hit, ui.id().with(("col-resize", k)), Sense::click_and_drag());
+        if resp.hovered() || resp.dragged() {
+            ui.painter().vline(line_x, header.y_range(), Stroke::new(2.0, theme::ACCENT));
+        }
+        if resp.dragged() {
+            // Growing a column takes the space from the others (Folder first).
+            let others_min: f32 = MIN_W.iter().sum::<f32>() - MIN_W[k];
+            let mut w = widths;
+            w[k] = (w[k] + resp.drag_delta().x).clamp(MIN_W[k], (avail - others_min).max(MIN_W[k]));
+            fit(&mut w, avail, Some(k));
+            // Shrinking a column of a full table gives the space to Folder.
+            let slack = avail - w.iter().sum::<f32>();
+            if k != 1 && slack > 0.0 && widths.iter().sum::<f32>() >= avail - 1.0 {
+                w[1] += slack;
+            }
+            app.cfg.column_widths = Some(w);
+        }
+        if resp.drag_stopped() {
+            // Store what is actually shown, after fitting to the window.
+            app.cfg.column_widths = Some(widths.map(f32::round));
+            let _ = app.cfg.save();
+        }
+        if resp.double_clicked() {
+            app.cfg.column_widths = None;
+            let _ = app.cfg.save();
+        }
+        resp.on_hover_cursor(egui::CursorIcon::ResizeColumn)
+            .on_hover_text("Drag to resize this column. Double-click to reset all columns.");
     }
 }
 
@@ -365,6 +522,7 @@ fn empty_state(app: &WinSearchApp, ui: &mut Ui) {
         ("↑ ↓   Enter", "Move the selection, open with the default app"),
         ("Ctrl+Enter", "Show the file in Explorer"),
         ("Ctrl+C", "Copy the selected path"),
+        ("F2", "Rename the selected file or folder"),
         ("Esc", "Clear the search, or close when empty"),
     ];
     let row_h = 26.0;
@@ -376,4 +534,45 @@ fn empty_state(app: &WinSearchApp, ui: &mut Ui) {
         ui.painter().text(egui::pos2(card.min.x + 210.0, y), Align2::LEFT_CENTER, *v, FontId::proportional(13.5), theme::TEXT_DIM);
     }
     ui.allocate_rect(card, Sense::hover());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn total(c: &Columns) -> f32 {
+        c.widths().iter().sum()
+    }
+
+    #[test]
+    fn automatic_columns_fill_the_table() {
+        let c = columns(1000.0, None);
+        assert!((total(&c) - (1000.0 - PAD_X * 2.0)).abs() < 0.01);
+        assert!((c.name / c.path - 0.40 / 0.60).abs() < 0.01);
+    }
+
+    #[test]
+    fn saved_widths_shrink_folder_first_to_fit() {
+        let c = columns(800.0, Some([300.0, 500.0, 90.0, 150.0]));
+        assert!(total(&c) <= 800.0 - PAD_X * 2.0 + 0.01);
+        assert_eq!((c.name, c.size, c.modified), (300.0, 90.0, 150.0));
+        // Very narrow: everything at its minimum, nothing below.
+        let c = columns(100.0, Some([300.0, 500.0, 90.0, 150.0]));
+        assert_eq!(c.widths(), MIN_W);
+        // Wider than needed: kept as saved.
+        let c = columns(2000.0, Some([300.0, 500.0, 90.0, 150.0]));
+        assert_eq!(c.widths(), [300.0, 500.0, 90.0, 150.0]);
+    }
+
+    #[test]
+    fn growing_a_column_takes_space_from_the_others() {
+        let mut w = [300.0, 400.0, 90.0, 150.0];
+        w[0] += 200.0;
+        fit(&mut w, 940.0, Some(0));
+        assert_eq!(w, [500.0, 200.0, 90.0, 150.0]);
+        let mut w = [300.0, 400.0, 90.0, 150.0];
+        w[1] += 200.0; // Folder grows: Name gives way first, then Modified
+        fit(&mut w, 940.0, Some(1));
+        assert_eq!(w, [120.0, 600.0, 90.0, 130.0]);
+    }
 }

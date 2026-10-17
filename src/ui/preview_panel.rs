@@ -214,7 +214,22 @@ fn ensure_texture(app: &mut WinSearchApp, ui: &Ui, p: &Preview, img: &ImageData)
     if app.preview_texture.as_ref().map(|(id, _)| *id) == Some(p.id) {
         return;
     }
-    let ci = ColorImage::from_rgba_unmultiplied([img.width as usize, img.height as usize], &img.rgba);
+    let (w, h) = (img.width as usize, img.height as usize);
+    if w == 0 || h == 0 || img.rgba.len() != w * h * 4 {
+        tracing::warn!(path = %p.path, w, h, len = img.rgba.len(), "preview image has inconsistent size; not shown");
+        return;
+    }
+    let mut ci = ColorImage::from_rgba_unmultiplied([w, h], &img.rgba);
+    // Older graphics drivers (often 4096 or 8192) cannot hold larger textures.
+    let max_side = ui.ctx().input(|i| i.max_texture_side).max(256);
+    if w.max(h) > max_side {
+        let scale = max_side as f32 / w.max(h) as f32;
+        let (nw, nh) = (((w as f32 * scale) as u32).max(1), ((h as f32 * scale) as u32).max(1));
+        if let Some(buf) = image::RgbaImage::from_raw(w as u32, h as u32, img.rgba.clone()) {
+            let small = image::imageops::resize(&buf, nw, nh, image::imageops::FilterType::Triangle);
+            ci = ColorImage::from_rgba_unmultiplied([nw as usize, nh as usize], small.as_raw());
+        }
+    }
     let tex = ui.ctx().load_texture(format!("preview-{}", p.id), ci, TextureOptions::LINEAR);
     app.preview_texture = Some((p.id, tex));
 }
@@ -466,7 +481,7 @@ fn sheet_view(app: &mut WinSearchApp, ui: &mut Ui, sheets: &[Sheet], h: f32) {
     let char_w = 7.2 * z;
     let widths: Vec<f32> = (0..ncols)
         .map(|c| {
-            let longest = sheet.rows.iter().take(200).map(|r| r[c].chars().count()).max().unwrap_or(0);
+            let longest = sheet.rows.iter().take(200).map(|r| r.get(c).map_or(0, |t| t.chars().count())).max().unwrap_or(0);
             (longest as f32 * char_w + 14.0 * z).clamp(48.0 * z, 260.0 * z)
         })
         .collect();
@@ -504,7 +519,7 @@ fn sheet_view(app: &mut WinSearchApp, ui: &mut Ui, sheets: &[Sheet], h: f32) {
                             p.rect_filled(cell, 0.0, theme::SURFACE);
                             p.text(cell.center(), Align2::CENTER_CENTER, col_name(c), FontId::proportional(11.5 * z), theme::TEXT_DIM);
                         } else {
-                            let text = &sheet.rows[r - 1][c];
+                            let text = sheet.rows.get(r - 1).and_then(|row| row.get(c)).map_or("", String::as_str);
                             if !text.is_empty() {
                                 let numeric = text.parse::<f64>().is_ok();
                                 let clip = p.with_clip_rect(cell.shrink(1.0));

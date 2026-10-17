@@ -4,6 +4,7 @@
 
 pub mod config;
 pub mod db;
+pub mod fileops;
 pub mod indexer;
 pub mod model;
 pub mod platform;

@@ -135,6 +135,8 @@ pub struct WinSearchApp {
     last_memory_sample: Instant,
 
     settings: settings::SettingsState,
+    /// Inline rename of one result, while the user edits its name.
+    rename: Option<RenameState>,
     toast: Option<(String, Instant)>,
     focus_search: bool,
     search_id: egui::Id,
@@ -185,6 +187,7 @@ impl WinSearchApp {
             last_live_refresh: Instant::now(),
             memory: platform::process_memory(),
             last_memory_sample: Instant::now(),
+            rename: None,
             toast: None,
             focus_search: true,
             search_id: egui::Id::new("search-box"),
@@ -317,6 +320,7 @@ impl WinSearchApp {
             return;
         }
         self.preview_requested_for = Some(hit.path.clone());
+        crate::crash::note(format!("previewing {}", hit.path));
         self.view.reset_for(&hit.path);
         if let Some(z) = self.debug_zoom {
             self.view.zoom = z;
@@ -393,6 +397,7 @@ impl WinSearchApp {
     pub fn open_selected(&mut self) {
         if let Some(h) = self.selected_hit() {
             let path = h.path.clone();
+            crate::crash::note(format!("opening {path} with its default app"));
             self.toast(format!("Opening {}", h.name));
             std::thread::spawn(move || {
                 if let Err(e) = platform::open_with_default_app(&path) {
@@ -405,6 +410,7 @@ impl WinSearchApp {
     pub fn reveal_selected(&mut self) {
         if let Some(h) = self.selected_hit() {
             let path = h.path.clone();
+            crate::crash::note(format!("showing {path} in Explorer"));
             std::thread::spawn(move || {
                 if let Err(e) = platform::reveal_in_explorer(&path) {
                     tracing::warn!("reveal {path}: {e}");
@@ -421,6 +427,96 @@ impl WinSearchApp {
         }
     }
 
+    /// Starts editing the selected result's name in place (F2).
+    pub fn start_rename(&mut self) {
+        let Some(hit) = self.selected_hit().cloned() else { return };
+        if util::split_path(&hit.path).is_none() || self.cfg.roots.iter().any(|r| r.eq_ignore_ascii_case(&hit.path)) {
+            self.toast("Indexed locations and drives cannot be renamed here".into());
+            return;
+        }
+        self.rename = Some(RenameState::new(&hit));
+        self.scroll_to_selected = true;
+        self.focus_search = false;
+    }
+
+    pub fn cancel_rename(&mut self) {
+        self.rename = None;
+        self.focus_search = true;
+    }
+
+    /// Renames the item on disk if the typed name is acceptable. On failure
+    /// the editor stays open with the reason shown under it.
+    fn commit_rename(&mut self) {
+        let Some(r) = self.rename.as_mut() else { return };
+        let from = r.path.clone();
+        let new_name = r.text.clone();
+        let Some((_, old_name)) = util::split_path(&from) else { return };
+        if new_name == old_name {
+            self.cancel_rename();
+            return;
+        }
+        if let Err(e) = winsearch::fileops::validate_name(&new_name) {
+            r.error = Some(e);
+            r.warning = false;
+            return;
+        }
+        let (old_ext, new_ext) = (util::ext_of(old_name, r.is_dir), util::ext_of(&new_name, r.is_dir));
+        if old_ext != new_ext && r.ext_confirmed.as_deref() != Some(new_name.as_str()) {
+            let shown = |e: &str| if e.is_empty() { "no extension".to_string() } else { format!(".{e}") };
+            r.error = Some(format!(
+                "This changes the extension from {} to {}, which can stop the file from opening. Press Enter again to rename anyway.",
+                shown(&old_ext),
+                shown(&new_ext)
+            ));
+            r.ext_confirmed = Some(new_name);
+            r.warning = true;
+            return;
+        }
+        crate::crash::note(format!("renaming {from} to {new_name}"));
+        match winsearch::fileops::rename(&from, &new_name) {
+            Ok(to) => {
+                tracing::info!(from = %from, to = %to, "renamed");
+                self.apply_rename(&from, &to);
+                self.indexer.notify_renamed(from, to);
+                self.rename = None;
+                self.focus_search = true;
+                self.toast(format!("Renamed to {new_name}"));
+            }
+            Err(e) => {
+                tracing::warn!(from = %from, to = %new_name, "rename failed: {e}");
+                r.error = Some(e);
+                r.warning = false;
+            }
+        }
+    }
+
+    /// Updates the visible results after a rename, before the index catches up.
+    fn apply_rename(&mut self, from: &str, to: &str) {
+        let prefix = format!("{from}\\");
+        for h in &mut self.results {
+            if h.path == from {
+                h.path = to.to_string();
+                if let Some((parent, name)) = util::split_path(to) {
+                    h.parent = parent.to_string();
+                    h.name = name.to_string();
+                }
+                h.ext = util::ext_of(&h.name, h.is_dir);
+            } else if h.path.len() > prefix.len()
+                && h.path.is_char_boundary(prefix.len())
+                && h.path[..prefix.len()].eq_ignore_ascii_case(&prefix)
+            {
+                // Items inside a renamed folder.
+                h.path = format!("{to}\\{}", &h.path[prefix.len()..]);
+                if let Some((parent, _)) = util::split_path(&h.path) {
+                    h.parent = parent.to_string();
+                }
+            }
+        }
+        // Preview the renamed item under its new path.
+        self.preview_requested_for = None;
+        self.set_selection(self.selected);
+    }
+
     fn toast(&mut self, msg: String) {
         self.toast = Some((msg, Instant::now()));
     }
@@ -428,6 +524,17 @@ impl WinSearchApp {
     fn handle_keys(&mut self, ctx: &egui::Context) {
         // A menu or dropdown is open: let it handle Esc/arrows itself.
         if egui::Popup::is_any_open(ctx) {
+            return;
+        }
+        if self.rename.is_some() {
+            // The name editor owns the keyboard; only Enter and Esc are ours.
+            let (enter, esc) =
+                ctx.input_mut(|i| (i.consume_key(Modifiers::NONE, Key::Enter), i.consume_key(Modifiers::NONE, Key::Escape)));
+            if esc {
+                self.cancel_rename();
+            } else if enter {
+                self.commit_rename();
+            }
             return;
         }
         if self.settings.open {
@@ -497,6 +604,9 @@ impl WinSearchApp {
         }
         if refresh {
             self.submit_search(true);
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F2)) {
+            self.start_rename();
         }
 
         // Preview zoom and PDF pages, usable while typing.
@@ -616,10 +726,11 @@ impl WinSearchApp {
                 }
             }
             ui.separator();
-            if ui.button("Choose a folder…").clicked()
-                && let Some(dir) = rfd::FileDialog::new().set_title("Search only inside this folder").pick_folder()
-            {
-                chosen = Some(Some(util::normalize_dir(&dir.to_string_lossy())));
+            if ui.button("Choose a folder…").clicked() {
+                crate::crash::note("choosing a search folder in the Windows folder dialog");
+                if let Some(dir) = rfd::FileDialog::new().set_title("Search only inside this folder").pick_folder() {
+                    chosen = Some(Some(util::normalize_dir(&dir.to_string_lossy())));
+                }
             }
         });
         resp.0.on_hover_text(match &self.scope {
@@ -990,9 +1101,10 @@ fn short_folder_label(p: &str) -> String {
     }
 }
 
-/// Options from the command line (`--query`, `--scope`) plus two testing
-/// aids read from the environment: `WINSEARCH_DEBUG_ZOOM` sets the preview
-/// zoom and `WINSEARCH_DEBUG_PAGE` the PDF page shown for the selection.
+/// Options from the command line (`--query`, `--scope`). Debug builds also
+/// read two testing aids from the environment: `WINSEARCH_DEBUG_ZOOM` sets
+/// the preview zoom and `WINSEARCH_DEBUG_PAGE` the PDF page shown for the
+/// selection. Release builds ignore them.
 #[derive(Default, Clone, Debug)]
 pub struct StartOptions {
     pub query: Option<String>,
@@ -1012,8 +1124,48 @@ impl StartOptions {
                 _ => {}
             }
         }
-        o.zoom = std::env::var("WINSEARCH_DEBUG_ZOOM").ok().and_then(|v| v.parse().ok());
-        o.page = std::env::var("WINSEARCH_DEBUG_PAGE").ok().and_then(|v| v.parse().ok());
+        #[cfg(debug_assertions)]
+        {
+            o.zoom = std::env::var("WINSEARCH_DEBUG_ZOOM").ok().and_then(|v| v.parse().ok());
+            o.page = std::env::var("WINSEARCH_DEBUG_PAGE").ok().and_then(|v| v.parse().ok());
+        }
         o
+    }
+}
+
+/// The inline name editor for one result.
+pub struct RenameState {
+    pub path: String,
+    pub is_dir: bool,
+    pub text: String,
+    /// Why the last attempt was refused, or a change to confirm.
+    pub error: Option<String>,
+    /// True when `error` is a warning to confirm rather than a refusal.
+    pub warning: bool,
+    /// The name for which an extension change was already confirmed.
+    pub ext_confirmed: Option<String>,
+    /// False until the editor has been focused with the name selected.
+    pub started: bool,
+}
+
+impl RenameState {
+    fn new(hit: &SearchHit) -> RenameState {
+        RenameState {
+            path: hit.path.clone(),
+            is_dir: hit.is_dir,
+            text: hit.name.clone(),
+            error: None,
+            warning: false,
+            ext_confirmed: None,
+            started: false,
+        }
+    }
+
+    /// Characters selected when editing starts: the name without its
+    /// extension, as in Explorer.
+    pub fn stem_chars(&self) -> usize {
+        let ext = util::ext_of(&self.text, self.is_dir);
+        let total = self.text.chars().count();
+        if ext.is_empty() { total } else { total - ext.chars().count() - 1 }
     }
 }

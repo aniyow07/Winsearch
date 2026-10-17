@@ -27,6 +27,11 @@ administrator rights.
     zoomable, with sheet tabs;
   * text and source code, folders, and file details plus the Windows
     thumbnail/icon for everything else.
+* Rename a result in place: F2 or right-click > Rename. The index and the
+  list update at once; invalid names, existing names and access problems
+  are explained under the name. Nothing is renamed until you press Enter.
+* Resizable columns: drag a divider in the header to resize the column on
+  its left; double-click a divider to reset. The widths are remembered.
 * Live index updates while the app runs, background reconciliation for
   changes made while it was closed, resumable initial indexing, and a
   status bar that says whether the index is up to date.
@@ -41,6 +46,7 @@ administrator rights.
 | Enter | open with the default app |
 | Ctrl+Enter or Ctrl+E | show in Explorer |
 | Ctrl+C | copy the selected path (or the selected text in the search box) |
+| F2 | rename the selected file or folder (Enter renames, Esc cancels) |
 | Ctrl + / Ctrl − / Ctrl 0 | zoom the preview / reset |
 | Ctrl+PageDown / Ctrl+PageUp | next / previous PDF page |
 | F5 | refresh results |
@@ -74,8 +80,9 @@ cargo test --release
 powershell -ExecutionPolicy Bypass -File scripts\package.ps1
 ```
 
-The release executable is `target\release\winsearch.exe`; the packaged zip
-is written to `dist\WinSearch-<version>-win-x64.zip` and is portable (no
+The release executable is `target\release\winsearch.exe`. The packaging
+script tests it and copies it to `dist\WinSearch-<version>\winsearch.exe`,
+one folder per release containing only the program. It is portable (no
 installer, copy anywhere).
 
 `winsearch.exe --query "text"` starts with a search filled in;
@@ -115,6 +122,7 @@ exclusions and options in **Settings** (gear icon or Ctrl+,).
 | Index | `%LOCALAPPDATA%\WinSearch\index.db` (+ `-wal`/`-shm`) |
 | Settings | `%LOCALAPPDATA%\WinSearch\config.json` |
 | Logs | `%LOCALAPPDATA%\WinSearch\logs\winsearch.<date>.log` (7 days kept; set `WINSEARCH_LOG=debug` for more) |
+| Crash reports | `winsearch-crash-<time>.txt` next to `winsearch.exe` (or in the logs folder if that folder is read-only) |
 
 Set `WINSEARCH_DATA_DIR` to use a different folder. Deleting the folder
 resets everything; Settings > Index status > Rebuild does the same for
@@ -131,8 +139,60 @@ rescan. The app never creates, resizes or deletes a change journal and
 never changes file-system settings. Settings > Locations shows which mode
 each location uses and why.
 
-WinSearch never modifies, moves, renames or deletes your files; it only
-reads directory listings and, for the selected file, its contents.
+WinSearch never modifies, moves or deletes your files. The only change it
+makes is a rename you type yourself (F2), which never replaces an existing
+item. Otherwise it only reads directory listings and, for the selected
+file, its contents.
+
+## Crash reports
+
+If WinSearch crashes, it writes `winsearch-crash-<time>.txt` next to the
+executable and, for errors in its own code, says so in a message box. The
+report holds the version, the Windows build, what you were doing (for
+example which file was being previewed), and either the error with a stack
+trace or, for a native crash, the exception code and the DLL it happened
+in. A DLL that is not `winsearch.exe` means another program's component
+(for example a shell extension or PDF handler) crashed inside WinSearch.
+The report contains file paths but nothing else from your files.
+
+## Why a second WinSearch process appears
+
+When you preview a PDF or a file type that needs a Windows thumbnail,
+WinSearch starts a second copy of `winsearch.exe` with the argument
+`--render-preview`. It has no window, renders that one page or thumbnail,
+passes the image back to the main window through a pipe and exits, usually
+within a second. This keeps crashes in Windows' PDF engine or in other
+programs' thumbnail handlers from closing the search window. It is the same
+file you started, never a downloaded or extracted one.
+
+## Antivirus warnings
+
+Microsoft Defender has flagged WinSearch builds as
+`Trojan:Win32/Bearfoos.B!ml`. The `!ml` suffix means a cloud
+machine-learning guess, not a match against known malware; new, unsigned
+programs that nobody else has run yet, that read the whole disk and that
+start copies of themselves are typical false positives. WinSearch has no
+network code, no installer, no packer or obfuscation, and its full source
+is in this repository.
+
+The executable carries version information, an application manifest
+(normal user rights, no elevation) and an icon, so it describes itself to
+Windows. That helps but guarantees nothing. What actually helps:
+
+* Report the false positive at
+  <https://www.microsoft.com/wdsi/filesubmission>: choose "Home customer"
+  (or "Software developer" with a Microsoft account), product "Microsoft
+  Defender Antivirus", upload `winsearch.exe` (zip it if the browser blocks
+  the upload), select "Incorrectly detected as malware/malicious", and give
+  the detection name and the link to this repository. Microsoft usually
+  answers within a few days and the fix reaches other PCs through
+  definition updates (`Update-MpSignature` speeds that up).
+* Sign the executable with a code-signing certificate (for example Azure
+  Trusted Signing or an OV/EV certificate). Signed files build reputation
+  across versions; unsigned ones start from zero with every build.
+
+To check a build locally:
+`& "$env:ProgramFiles\Windows Defender\MpCmdRun.exe" -Scan -ScanType 3 -File <path>\winsearch.exe`.
 
 ## Design and measurements
 

@@ -157,9 +157,6 @@ fn decode_output(out: &[u8]) -> Result<HelperOutput, String> {
 /// next to the current executable (the CLI and tests live in the same
 /// target directory).
 fn helper_exe() -> Option<std::path::PathBuf> {
-    if let Ok(p) = std::env::var("WINSEARCH_HELPER") {
-        return Some(p.into());
-    }
     let cur = std::env::current_exe().ok()?;
     let dir = cur.parent()?;
     for cand in [dir.join("winsearch.exe"), dir.join("..").join("winsearch.exe")] {
